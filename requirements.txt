@@ -1,0 +1,12 @@
+# --- Required to run the scaffold today ---
+streamlit
+pandas
+plotly
+
+# --- Uncomment as you wire in the real evaluate_video() logic ---
+# yt-dlp                # download videos from TikTok / YouTube / Instagram
+# opencv-python-headless # CV metrics (use -headless on servers, not opencv-python)
+# numpy                 # array work for frame processing
+# Pillow                # keyframe image handling
+# anthropic             # if using Claude as the LLM judge
+# openai                # if using an OpenAI model instead
