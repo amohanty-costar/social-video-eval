@@ -12,7 +12,6 @@ judge is not wired in yet).
 - `config.py` — all tunable thresholds/settings
 - `rubric.md` — evaluation rubric, loaded at runtime
 - `requirements.txt` — Python dependencies
-- `cv_gate_explainer.md` — how the CV gate detectors work
 
 ## Run locally
 
