@@ -1,5 +1,10 @@
+# PURPOSE: Python packages this project needs.
+# Install with: pip install -r requirements.txt
+
 opencv-python-headless
 numpy
-google-genai
+# 1.47.0 is the last google-genai release that supports Python 3.9, which this
+# venv is on. Newer releases (and the Interactions API) require Python 3.10+.
+google-genai==1.47.0
 requests
 streamlit

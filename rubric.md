@@ -1,3 +1,19 @@
+<!--
+PURPOSE: The evaluation rubric -- the standard every video is scored
+against. This file is the source of truth: it is read at runtime and
+injected into the judge prompt, so editing it changes the evaluation.
+
+Tier 1 is enforced in code by the CV gate. Tiers 2 and 3 are judged by
+Gemini. The deduction points and the Final score section are stripped
+out before the rubric reaches the model (see evaluate.py::_rubric_text),
+so it rules on what it sees and the arithmetic stays in code.
+
+If you edit the rules or severities here, update COMPLIANCE_RULES in
+config.py to match -- the tests check the two agree.
+
+This comment is stripped before the rubric is sent to Gemini.
+-->
+
 # Property Marketing Video - Evaluation Rubric
 
 AI-generated listing videos (Short / Medium / Long) • v1.0 • CV = objective computer-vision metric | LLM = model judgment • evaluated in three tiers by severity
@@ -13,13 +29,13 @@ Triggers on **noticeable** motion failures - lurches, stutters, glitches, or uns
 | Dimension | 5 | 3 | 1 |
 |---|---|---|---|
 | **Tour Flow & Sequencing**<br>LLM | Progression follows a natural path (e.g. entry - main living spaces - private rooms); adjacent rooms feel connected; open-plan spaces shown as one continuous move | Serviceable but arbitrary order; a few transitions feel abrupt or jump between distant areas | Random / disorienting; cuts between unrelated spaces; viewer can't build a mental map of the layout |
-| **Hook / Opening**<br>LLM + CV | First ~3s arresting; strong sharp lead shot | Opens on a real interior but the shot is static or unremarkable - no immediate sense of the property's best feature | Weak / slow open (empty space, logo card, dead space, dim or soft shot) |
+| **Hook / Opening**<br>LLM + CV | First ~3s arresting; strong sharp lead shot | Opens on a real interior but the shot is static or unremarkable - no immediate sense of the property's best feature | Weak / slow open (empty space, dead space, dim or soft shot) |
 | **Emotional / Aspirational Appeal**<br>LLM | Evokes what it'd be like to live there - e.g. natural light, warmth, inviting flow between spaces, lifestyle feel; not an exhaustive checklist, just a genuine sense of desirability | Pleasant but flat; shows the home adequately but doesn't stir any feeling | Sterile; feels like an inventory list; rooms presented as empty boxes to be catalogued |
 | **Framing & Composition**<br>LLM + CV | Flattering angles; level, open, shows off space; e.g. shot from a corner or doorway to reveal room depth | Some flat, cramped, or slightly off angles | Awkward; tilted horizons, walls-in-face, cramped crops |
 
 ## Tier 3 - Compliance rules (pass / fail with MM:SS evidence • each failure deducts points from the base)
 
-| Severity | Rule | Applies | Deduction |
+| Severity | Violation | Applies | Deduction |
 |---|---|---|---|
 | Critical | Kitchen not shown at all | All | -10 |
 | Critical | Living room not shown at all | All | -10 |

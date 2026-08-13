@@ -2,19 +2,28 @@
 """
 evaluate.py
 ===========
-Property marketing video evaluation pipeline: ingest -> CV gate -> Gemini
-judge -> composite score. See rubric.md for the evaluation rubric and
-config.py for all tunable values.
+PURPOSE: The engine. All the evaluation logic lives here.
 
-Import `evaluate_video(source, template_type)` to run the full pipeline
-programmatically (used by a dashboard or batch runner); the CLI at the
-bottom is a thin wrapper around the same function.
+Runs one video through the pipeline:
+    ingest -> CV gate (Tier 1) -> Gemini judge (Tier 2/3) -> composite score
+
+A video that fails the gate scores 0 and never reaches the API.
+
+Call `evaluate_video(source, template_type)` to run the whole thing. The web
+app does exactly that, and the CLI at the bottom of this file is a thin wrapper
+around the same function, so all three behave identically.
+
+Settings live in config.py, the judge prompt in prompt.md, the rubric in
+rubric.md. Nothing in this file needs editing to retune the evaluation.
 """
 
 import argparse
 import json
+import random
+import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -476,38 +485,820 @@ def run_cv_gate(local_path):
 # ============================================================================
 # JUDGE
 # ============================================================================
-# Built in Part 5 (blocked pending data-privacy sign-off): Gemini Files API
-# upload, rubric-based prompt, structured JSON output, retry/backoff.
+# Tier-2 dimensions and Tier-3 compliance rules, judged by Gemini in a single
+# structured-output call against the video.
+#
+# Shape of the call:
+#   1. Upload the video via the Files API and poll until it reaches ACTIVE
+#      (a file in PROCESSING cannot be referenced in a prompt yet).
+#   2. One generate_content call with the video part first, prompt second (the
+#      documented ordering for single-video prompts), and a response_schema
+#      pinning the exact JSON we need.
+#   3. Delete the uploaded file.
+#
+# One call rather than several: the model sees the whole tour once, so the room
+# sequence it reports and the rules it evaluates against that sequence come from
+# a single pass and are far more likely to agree. Nothing *forces* them to
+# agree, so cross_check_stop_rules() flags it when they don't. The cost of one
+# call is that a bad response loses everything, which is what the retry/backoff
+# wrapper is for.
+#
+# Two things the judge is deliberately not told: the point value of each
+# compliance rule, and the formula that turns scores into a composite. See
+# _rubric_text().
+#
+# Note on fidelity: Gemini samples video at 1 FPS for visual understanding.
+# Room sequencing and compliance rules survive that fine. The "first ~3s"
+# hook dimension is working from roughly three frames, so treat its score as
+# the weakest signal in the report. The rubric marks Hook and Framing as
+# "LLM + CV"; today they are LLM-only, since no CV signal is passed in here.
+
+
+class JudgeError(RuntimeError):
+    """Raised when the judge cannot produce a usable verdict."""
+
+
+# Both prompt.md and rubric.md open with an explanatory <!-- --> block written
+# for whoever is reading the file. Neither should reach the model.
+_PROMPT_COMMENT_RE = re.compile(r"^\s*<!--.*?-->\s*", re.DOTALL)
+
+
+def _read_asset(path_value, label):
+    """Load a runtime asset (prompt.md / rubric.md), resolved next to this file."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    if not path.is_file():
+        raise JudgeError(f"{label} file not found: {path}")
+    return path.read_text(encoding="utf-8")
 
 
 # ============================================================================
-# SCORING
+# THE RUBRIC AS THE JUDGE SEES IT
 # ============================================================================
-# Built in Part 6: composite score from the judge's dimension scores and
-# rule pass/fail results, using config.DIMENSION_WEIGHT and
-# config.DEDUCTION_POINTS.
+# rubric.md is the single source of truth, but the judge does NOT receive all
+# of it. Three things are removed on the way in:
+#
+#   1. TIER 1 (the technical motion gate).
+#      The judge is only ever called on a video that already PASSED the gate --
+#      run_cv_gate() runs first and evaluate_video() returns a score of 0
+#      without constructing a client if it fails. So Tier 1 is not the judge's
+#      job, and showing it invites the model to re-litigate motion quality it
+#      was not asked about and cannot see properly at 1 FPS.
+#
+#   2. The Tier-3 DEDUCTION column.
+#      A model that knows a critical rule costs 10 points goes soft on critical
+#      rules. It rules on what it sees; score() applies the cost afterwards.
+#
+#   3. The "Final score" section.
+#      Contains the composite formula. Same reasoning -- knowing the formula
+#      invites reasoning backward from a total the model thinks is deserved.
+#
+# The Tier-2 table is passed through completely intact, including its "1"
+# column, which is the last cell on those rows and must not be mistaken for a
+# deduction cell.
+# ============================================================================
+def _rubric_text(for_prompt=True):
+    """
+    Load rubric.md. With for_prompt=True, return the judge-facing version with
+    Tier 1, the Deduction column and the Final score section removed.
+    Pass for_prompt=False for the unmodified file.
+    """
+    text = _read_asset(config.RUBRIC_PATH, "Rubric")
+    if not for_prompt:
+        return text
+
+    # rubric.md opens with an explanatory <!-- --> block for humans reading the
+    # file. Same treatment as prompt.md's: strip it so it never reaches Gemini.
+    text = _PROMPT_COMMENT_RE.sub("", text, count=1)
+
+    out = []
+    in_tier1 = False
+    in_tier3 = False
+    for line in text.splitlines():
+        if line.startswith("## Final score"):
+            break  # everything from here down is scoring arithmetic
+
+        # Section tracking. Any "## " heading closes the previous section, so
+        # a renamed or reordered rubric degrades gracefully rather than
+        # silently swallowing the wrong block.
+        if line.startswith("## "):
+            in_tier1 = line.startswith("## Tier 1")
+            in_tier3 = line.startswith("## Tier 3")
+
+        if in_tier1:
+            continue  # drop the gate section entirely
+
+        # Only the Tier-3 table has a Deduction column to drop.
+        if in_tier3 and line.startswith("|"):
+            cells = line.split("|")
+            if cells and cells[-1].strip() == "":
+                cells = cells[:-1]
+            if len(cells) > 2:
+                line = "|".join(cells[:-1]) + " |"
+
+        out.append(line)
+
+    # Collapse the blank-line run left behind where Tier 1 used to be.
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(out))
+    return cleaned.rstrip() + "\n"
+
+
+# ============================================================================
+# TEMPLATE TYPE -> WHICH RULES APPLY
+# ============================================================================
+# This is the single place the Template dropdown changes the evaluation.
+#
+# The path is:
+#   video-eval-tool.py   st.selectbox("Template", ["short", "medium", "long"])
+#     -> evaluate_video(source, template_type, judge=...)
+#          -> run_judge(local_path, template_type)
+#               -> _judge_prompt(template_type)     fills {{TEMPLATE_TYPE}}
+#               -> _response_schema(template_type)  limits the rule fields
+#          -> score(verdict, template_type)         limits the deductions
+#
+# All three of those call applicable_rules() below, so the dropdown decides
+# what the model is asked, what it is allowed to answer, and what gets scored.
+# They cannot drift apart.
+#
+# In practice only the bathroom rule differs: it is PROHIBITED in Short and
+# REQUIRED in Medium/Long, so exactly one of the two bathroom rules applies to
+# any given video and the other is never sent to the model at all. That is why
+# a report always has 9 rules, not 10.
+# ============================================================================
+def applicable_rules(template_type):
+    """The Tier-3 rules evaluated for this template type (bathroom differs)."""
+    return [r for r in config.COMPLIANCE_RULES if template_type in r["applies"]]
+
+
+# ============================================================================
+# GUARDRAILS
+# ============================================================================
+# These live in the schema's `description` fields rather than in prompt.md,
+# for two reasons: prompt.md stays clean and readable as an instruction, and
+# Gemini reads schema descriptions as binding constraints on each field rather
+# than as general advice it can weigh against everything else.
+#
+# Each one exists to prevent a specific, known failure mode:
+#
+#   RULE POLARITY (`violated` description)
+#     The Tier-3 list mixes rules violated by ABSENCE ("kitchen not shown")
+#     with rules violated by PRESENCE ("closet shown"). Models routinely invert
+#     mixed-direction lists.
+#
+#   PANNING CARVE-OUT (`violated` description)
+#     The judge is told a motion gate already ran. Two compliance rules are
+#     nonetheless about panning -- where the camera points, and whether it
+#     retraces itself -- so it needs telling those are still its job.
+#
+#   EVIDENCE BEFORE VERDICT (field ORDER, not text)
+#     The SDK derives propertyOrdering from the order keys appear below, and
+#     the model emits fields in that order. `evidence` and `rationale` come
+#     before `score`, and `evidence` before `violated`, so the reasoning drives
+#     the verdict instead of justifying one already committed to. Reordering
+#     these keys silently changes model behaviour.
+#
+#   STOP DEFINITION (`room_sequence` description)
+#     The two "first 3 stops" rules are only meaningful against a consistent
+#     definition of a stop.
+#
+#   NO POINT VALUES (handled upstream in _rubric_text)
+#     The judge never learns what a verdict costs.
+#
+# A fourth guardrail runs after the response arrives rather than constraining
+# it: cross_check_stop_rules() compares the "first 3 stops" verdicts against
+# the model's own room_sequence and flags disagreement.
+# ============================================================================
+def _response_schema(template_type):
+    """
+    JSON Schema for the judge's reply. Only the rules that apply to this
+    template are included, so the model is never asked to rule on the
+    prohibited-vs-required bathroom case that doesn't apply.
+    """
+    timestamp = {
+        "type": "string",
+        "description": "Timestamp in MM:SS format, e.g. 01:15.",
+    }
+
+    # Field order matters. The SDK derives propertyOrdering from the order of
+    # these keys, and the model emits fields in that order -- so evidence and
+    # rationale must come BEFORE score, or the score is generated first and the
+    # rationale becomes post-hoc justification for a number already committed to.
+    dimension = {
+        "type": "object",
+        "properties": {
+            "evidence": {
+                "type": "array", "items": timestamp, "minItems": 1,
+                "description": "Timestamps of the moments you are basing this on. Gather these first.",
+            },
+            "rationale": {
+                "type": "string",
+                "description": "Two or three sentences on what those moments show, referring to what is actually on screen. Reason here before choosing a score.",
+            },
+            "score": {
+                "type": "integer", "minimum": 1, "maximum": 5,
+                "description": "1-5 per the rubric, following from the evidence and rationale above. Use 4 and 2 to interpolate between the anchored 5/3/1 descriptions.",
+            },
+        },
+        "required": ["evidence", "rationale", "score"],
+    }
+
+    rule_ids = [r["id"] for r in applicable_rules(template_type)]
+
+    return {
+        "type": "object",
+        "properties": {
+            # GUARDRAIL: the "stop" definition, which the two "first 3 stops"
+            # rules are evaluated against.
+            "room_sequence": {
+                "type": "array",
+                "description": (
+                    "The ordered tour stops. One entry per distinct space in order of first "
+                    "appearance. Contiguous open-plan areas (e.g. a kitchen open to the living "
+                    "room with no wall between them) count as ONE stop. Do not repeat a space "
+                    "that is revisited later. The 'first 3 stops' compliance rules are judged "
+                    "against this list, so keep those verdicts consistent with it."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "stop": {"type": "integer", "minimum": 1,
+                                  "description": "1-based position in the tour."},
+                        "room": {"type": "string",
+                                  "description": "Short name, e.g. 'entry', 'kitchen', 'living room', 'primary bedroom'."},
+                        "first_seen": timestamp,
+                    },
+                    "required": ["stop", "room", "first_seen"],
+                },
+            },
+            "dimensions": {
+                "type": "object",
+                "properties": {name: dimension for name in config.DIMENSIONS},
+                "required": list(config.DIMENSIONS),
+            },
+            "rules": {
+                "type": "object",
+                "description": "One verdict per compliance rule. `violated` true means the condition described by the rule IS present.",
+                "properties": {
+                    # evidence before violated, for the same reason as the
+                    # dimensions above: state what you saw, then rule on it.
+                    rid: {
+                        "type": "object",
+                        "properties": {
+                            "evidence": {
+                                "type": "string",
+                                "description": (
+                                    "What you actually saw that bears on this rule, with MM:SS "
+                                    "timestamps. State this before deciding `violated`."
+                                ),
+                            },
+                            # GUARDRAIL: rule polarity + panning carve-out.
+                            "violated": {
+                                "type": "boolean",
+                                "description": (
+                                    "True if the condition named by this rule HAS occurred. "
+                                    "Read the direction carefully: some rules are violated by "
+                                    "something being ABSENT ('not shown at all', 'not within "
+                                    "the first 3 stops') and others by something being PRESENT "
+                                    "('closet shown'). A separate technical check already judged "
+                                    "motion smoothness, so do not consider stutters, glitches or "
+                                    "camera lurches here -- but the two panning rules below ARE "
+                                    "yours to judge, since they concern where the camera is "
+                                    "pointed and whether it retraces itself, not how smoothly it "
+                                    "moves. Each rule counts once no matter how often it recurs."
+                                ),
+                            },
+                        },
+                        "required": ["evidence", "violated"],
+                    }
+                    for rid in rule_ids
+                },
+                "required": rule_ids,
+            },
+            # Two distinct summaries. showcase_summary is DESCRIPTIVE (what is
+            # in the video); summary is EVALUATIVE (why it scored as it did).
+            # Kept apart so the descriptive one doesn't quietly become a second
+            # verdict, and because the report shows them in different places.
+            "showcase_summary": {
+                "type": "string",
+                "description": (
+                    "Two or three sentences describing what the video showcases -- the "
+                    "property and what is actually shown. Purely descriptive: no judgment, "
+                    "no scoring language."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Three or four sentences in plain language on why the video scored the "
+                    "way it did. Written for a listing agent, not a video editor."
+                ),
+            },
+            "top_fixes": {
+                "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3,
+                "description": "The highest-leverage concrete changes, most impactful first.",
+            },
+        },
+        "required": ["room_sequence", "dimensions", "rules",
+                      "showcase_summary", "summary", "top_fixes"],
+    }
+
+
+# ============================================================================
+# BUILDING THE PROMPT
+# ============================================================================
+# The prompt text itself lives in prompt.md, NOT here. This function only
+# assembles it:
+#
+#   1. strips the HTML comment header from prompt.md
+#   2. substitutes {{TEMPLATE_TYPE}} with the dropdown value
+#   3. injects the judge-facing rubric between the <rubric></rubric> tags
+#   4. appends the applicable rule ids and one neutral bathroom note
+#
+# To change what the judge is asked, edit prompt.md. To change what it is
+# allowed to answer, edit _response_schema(). Behavioural guardrails live in
+# the schema's field descriptions rather than here -- see the GUARDRAILS block
+# above _response_schema().
+# ============================================================================
+_RUBRIC_SLOT_RE = re.compile(r"<rubric>\s*</rubric>", re.DOTALL)
+
+
+def _judge_prompt(template_type):
+    """Assemble the full judge instruction for one template type."""
+    text = _read_asset(config.PROMPT_PATH, "Prompt")
+
+    # 1. Drop the explanatory <!-- --> header; it is for humans reading the file.
+    text = _PROMPT_COMMENT_RE.sub("", text, count=1)
+
+    # 2. Template type from the web app's dropdown.
+    if "{{TEMPLATE_TYPE}}" not in text:
+        raise JudgeError(
+            f"{config.PROMPT_PATH} is missing the {{{{TEMPLATE_TYPE}}}} placeholder; "
+            "the judge would not be told which template it is evaluating."
+        )
+    text = text.replace("{{TEMPLATE_TYPE}}", template_type)
+
+    # 3. Rubric injection -- Tier 1, deductions and the score formula already
+    #    removed by _rubric_text().
+    if not _RUBRIC_SLOT_RE.search(text):
+        raise JudgeError(
+            f"{config.PROMPT_PATH} is missing an empty <rubric></rubric> block "
+            "for the rubric to be injected into."
+        )
+    text = _RUBRIC_SLOT_RE.sub(
+        lambda _: "<rubric>\n" + _rubric_text().strip() + "\n</rubric>", text, count=1
+    )
+
+    # 4. The applicable rule ids, so the model's verdicts map onto the schema
+    #    keys. Severities are deliberately omitted -- the judge rules on what it
+    #    sees and score() applies the cost. See the TEMPLATE TYPE block above for
+    #    why this list is 9 rules and not 10.
+    rule_lines = "\n".join(
+        f"- `{r['id']}`: {r['description']}" for r in applicable_rules(template_type)
+    )
+
+    # Neutral bathroom note. Phrased as "report whether one is in fact visible"
+    # rather than "a bathroom must be shown": the Medium/Long rule is violated by
+    # ABSENCE, and stating the requirement as an imperative makes hallucinating a
+    # bathroom the path of least resistance.
+    bathroom_note = (
+        "For this template the rubric prohibits showing a bathroom."
+        if template_type == "short"
+        else "For this template the rubric expects a bathroom. Report whether one is "
+             "in fact visible; do not assume one is present because the rubric expects it."
+    )
+
+    return f"""{text.rstrip()}
+
+Rule the following compliance items, using exactly these ids:
+
+{rule_lines}
+
+{bathroom_note}"""
+
+
+def _get_client():
+    """Build a Gemini client, with an actionable error if no key is configured."""
+    try:
+        from google import genai
+    except ImportError as e:
+        raise JudgeError(
+            "The google-genai package is not installed. Run: pip install -r requirements.txt"
+        ) from e
+
+    api_key = config.gemini_api_key()
+    if not api_key:
+        raise JudgeError(
+            "No Gemini API key configured. Set the GEMINI_API_KEY environment variable, "
+            "or add GEMINI_API_KEY to .streamlit/secrets.toml. "
+            "Run with --no-judge to skip the judge and use the CV gate only."
+        )
+    return genai.Client(api_key=api_key)
+
+
+def _wait_until_active(client, uploaded):
+    """
+    Block until Gemini reports the uploaded file ACTIVE. A file still in
+    PROCESSING cannot be referenced in a prompt. Raises on FAILED or timeout;
+    the caller owns deleting the file either way.
+    """
+    waited = 0
+    while True:
+        state = getattr(uploaded.state, "name", str(uploaded.state or ""))
+        if state == "ACTIVE":
+            return uploaded
+        if state == "FAILED":
+            raise JudgeError(f"Gemini failed to process the uploaded video (file {uploaded.name}).")
+        if waited >= config.GEMINI_UPLOAD_TIMEOUT_SEC:
+            raise JudgeError(
+                f"Uploaded video was still in state {state!r} after "
+                f"{config.GEMINI_UPLOAD_TIMEOUT_SEC}s (file {uploaded.name})."
+            )
+        time.sleep(config.GEMINI_UPLOAD_POLL_SEC)
+        waited += config.GEMINI_UPLOAD_POLL_SEC
+        uploaded = client.files.get(name=uploaded.name)
+
+
+def _is_retryable(exc):
+    """
+    True for rate limits and transient server errors, which are worth another
+    attempt. Everything else -- bad key, bad model name, safety block, malformed
+    schema -- fails the same way every time, so retrying only burns quota.
+
+    The status code is the reliable signal. The text fallback deliberately does
+    NOT match bare numbers like "429" or "500": those appear in token counts and
+    quota values inside the messages of genuinely fatal errors, which would then
+    get retried five times for nothing.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code in (408, 429, 500, 502, 503, 504):
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in (
+        "rate limit", "resource_exhausted", "quota exceeded", "too many requests",
+        "internal error", "internal server error", "unavailable", "deadline exceeded",
+        "overloaded", "try again later",
+    ))
+
+
+def _generate_with_retry(client, contents, schema):
+    """
+    One structured-output call, retried with exponential backoff on 429s and
+    transient 5xxs. Anything else (bad key, bad model name, safety block) is
+    raised immediately -- retrying those just wastes time and quota.
+    """
+    from google.genai import types
+
+    cfg = dict(
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
+    if config.GEMINI_TEMPERATURE is not None:
+        cfg["temperature"] = config.GEMINI_TEMPERATURE
+    if config.GEMINI_MEDIA_RESOLUTION:
+        cfg["media_resolution"] = config.GEMINI_MEDIA_RESOLUTION
+
+    last = None
+    for attempt in range(config.GEMINI_MAX_RETRIES):
+        try:
+            return client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(**cfg),
+            )
+        except Exception as e:  # noqa: BLE001 - SDK raises a range of transport errors
+            last = e
+            if not _is_retryable(e) or attempt == config.GEMINI_MAX_RETRIES - 1:
+                raise JudgeError(f"Gemini judge call failed: {e}") from e
+            # BASE * 2^attempt (2, 4, 8, 16s at the default), plus jitter so a
+            # batch run doesn't retry in lockstep and re-trip the rate limit.
+            backoff = config.GEMINI_BACKOFF_BASE_SEC * (2 ** attempt)
+            time.sleep(backoff + random.uniform(0, backoff * 0.25))
+    raise JudgeError(f"Gemini judge call failed after {config.GEMINI_MAX_RETRIES} attempts: {last}")
+
+
+def _finish_reason(response):
+    """The first candidate's finish_reason, if the SDK surfaced one."""
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return None
+    reason = getattr(candidates[0], "finish_reason", None)
+    return getattr(reason, "name", None) or (str(reason) if reason else None)
+
+
+def _coerce_score(value):
+    """
+    Normalise a dimension score to an int, or return None if it isn't one.
+    The schema declares INTEGER so this should always already be an int, but a
+    JSON `4.0` is legal and shouldn't fail the whole run. Booleans are rejected
+    explicitly -- in Python `True` is an int and would silently score as 1.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _parse_judge_response(response, template_type):
+    """Pull the JSON payload out of the response and check it has what scoring needs."""
+    # .text returns None on an empty response in google-genai 1.x, but some
+    # versions raise instead, so treat both as "no usable text".
+    try:
+        text = response.text
+    except (ValueError, AttributeError):
+        text = None
+
+    finish = _finish_reason(response)
+
+    if not text:
+        raise JudgeError(
+            "Gemini returned no text (the video may have been blocked or the response truncated"
+            + (f"; finish_reason={finish}" if finish else "") + ")."
+        )
+
+    try:
+        verdict = json.loads(text)
+    except json.JSONDecodeError as e:
+        # A MAX_TOKENS truncation produces partial JSON and lands here, so
+        # surface finish_reason -- otherwise this reads as a model defect when
+        # it is really a length limit.
+        hint = f" (finish_reason={finish})" if finish else ""
+        if finish == "MAX_TOKENS":
+            hint += (
+                " -- the response was cut off by the output token limit; "
+                "raise max_output_tokens or shorten the schema."
+            )
+        raise JudgeError(f"Gemini returned text that is not valid JSON{hint}: {e}") from e
+
+    # The schema is enforced server-side, but a schema-valid response can still
+    # be semantically wrong, so validate what the scoring math depends on.
+    dims = verdict.get("dimensions") or {}
+    for name in config.DIMENSIONS:
+        entry = dims.get(name)
+        if not isinstance(entry, dict):
+            raise JudgeError(f"Judge response is missing dimension {name!r}.")
+        score_value = _coerce_score(entry.get("score"))
+        if score_value is None:
+            raise JudgeError(
+                f"Judge response has no usable integer score for dimension {name!r} "
+                f"(got {entry.get('score')!r})."
+            )
+        if not 1 <= score_value <= 5:
+            raise JudgeError(
+                f"Judge returned an out-of-range score for {name!r}: {score_value} (expected 1-5)."
+            )
+        entry["score"] = score_value
+
+    rules = verdict.get("rules") or {}
+    for rule in applicable_rules(template_type):
+        entry = rules.get(rule["id"])
+        if not isinstance(entry, dict) or not isinstance(entry.get("violated"), bool):
+            raise JudgeError(f"Judge response is missing a verdict for rule {rule['id']!r}.")
+
+    return verdict
+
+
+# The two "first 3 stops" rules are the only ones mechanically derivable from
+# the room_sequence the judge also returns, so they can be cross-checked. A
+# disagreement means the judge contradicted itself; we surface it rather than
+# silently overriding, because room naming is fuzzy ("kitchen/dining", "great
+# room") and a naive string match is not authoritative enough to overrule the
+# model that actually watched the video.
+_STOP_RULE_KEYWORDS = {
+    "kitchen_not_in_first_3_stops": ("kitchen",),
+    "living_room_not_in_first_3_stops": ("living", "lounge", "family room", "great room"),
+}
+
+
+def cross_check_stop_rules(verdict):
+    """
+    Compare the judge's "not within the first 3 stops" verdicts against its own
+    room_sequence. Returns a list of human-readable warnings; empty when the
+    verdict is self-consistent or the sequence is too sparse to judge.
+    """
+    sequence = verdict.get("room_sequence") or []
+    if not sequence:
+        return []
+
+    ordered = sorted(sequence, key=lambda s: s.get("stop", 0))
+    first_three = " | ".join(str(s.get("room", "")).lower() for s in ordered[:3])
+
+    warnings = []
+    for rule_id, keywords in _STOP_RULE_KEYWORDS.items():
+        entry = (verdict.get("rules") or {}).get(rule_id)
+        if not isinstance(entry, dict) or not isinstance(entry.get("violated"), bool):
+            continue
+        present = any(k in first_three for k in keywords)
+        if present and entry["violated"]:
+            warnings.append(
+                f"{rule_id}: judge marked this violated, but its own room sequence lists "
+                f"{keywords[0]} within the first 3 stops ({first_three})."
+            )
+        elif not present and not entry["violated"] and len(ordered) >= 3:
+            warnings.append(
+                f"{rule_id}: judge marked this satisfied, but its own room sequence's first "
+                f"3 stops ({first_three}) do not appear to include {keywords[0]}."
+            )
+    return warnings
+
+
+def run_judge(local_path, template_type):
+    """
+    Run the Gemini rubric judge on a video that has already passed the CV gate.
+    Returns the parsed verdict: room_sequence, dimensions, rules, summary,
+    top_fixes. Raises JudgeError on any unusable outcome.
+    """
+    client = _get_client()
+
+    # Upload first, then everything else inside the try -- a video that fails
+    # processing or times out has still been created server-side, and must be
+    # deleted on that path too.
+    uploaded = client.files.upload(file=local_path)
+    try:
+        _wait_until_active(client, uploaded)
+        response = _generate_with_retry(
+            client,
+            # Video part first, text second: the documented ordering for
+            # single-video prompts.
+            contents=[uploaded, _judge_prompt(template_type)],
+            schema=_response_schema(template_type),
+        )
+        verdict = _parse_judge_response(response, template_type)
+        verdict["consistency_warnings"] = cross_check_stop_rules(verdict)
+        return verdict
+    finally:
+        if config.GEMINI_DELETE_UPLOAD_AFTER_USE:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass  # the file expires on its own; not worth failing the run over
+
+
+# ============================================================================
+# SCORING -- THIS IS WHERE THE COMPOSITE SCORE IS CALCULATED
+# ============================================================================
+# The division of labour between the model and this code:
+#
+#   THE LLM JUDGES            THIS CODE CALCULATES
+#   the four 1-5 sub-scores   the composite out of 100
+#   every rule verdict        the point value of each failed rule
+#   the room sequence         nothing else
+#   rationales and evidence
+#
+# So if you are looking for where the headline score comes from: it is here,
+# not in prompt.md and not in anything Gemini returns. prompt.md item 3 asks
+# for the composite as the report headline, but the model is told it is
+# supplied for it, and _response_schema() gives it no field to put a total in.
+# score() computes it from the sub-scores and verdicts the model DID return,
+# and never overrides a judgment.
+#
+# Why it is done this way:
+#   - LLM arithmetic is unreliable. It will occasionally drop a deduction or
+#     average four numbers slightly wrong, and there is no way to tell from
+#     the output that it happened.
+#   - If the model returned both sub-scores and a total, the two could
+#     disagree and there would be no principled way to pick one.
+#   - Having the model total it up means telling it what each rule costs,
+#     which makes it lenient on the expensive ones. _rubric_text() strips the
+#     Tier-3 deduction column for exactly this reason.
+#   - Identical verdicts now always produce an identical composite.
+#
+# The arithmetic itself:
+#   base       = weighted sum of the four 1-5 dimension scores, x20
+#                (achievable range 20-100, since the lowest average is 1)
+#   deductions = config.DEDUCTION_POINTS per violated compliance rule
+#   composite  = max(0, base - deductions)
+#
+# With all four weights at 0.25 the weighted sum is just the average, which is
+# what rubric.md specifies. They are applied per-dimension so re-weighting one
+# is a config.DIMENSION_WEIGHTS change and nothing else (they must still sum
+# to 1.0). Deduction values are config.DEDUCTION_POINTS. Neither requires a
+# prompt change or a re-run -- which is what rubric.md means when it says
+# weights and deduction points are config values.
+
+
+def score(verdict, template_type):
+    """
+    Turn a judge verdict into the scored report: per-dimension detail, failed
+    rules with their deductions, and the composite out of 100.
+    """
+    weights = dict(config.DIMENSION_WEIGHTS)
+    missing = [name for name in config.DIMENSIONS if name not in weights]
+    if missing:
+        raise ValueError(f"config.DIMENSION_WEIGHTS is missing an entry for: {missing}")
+    total_weight = sum(weights[name] for name in config.DIMENSIONS)
+    if abs(total_weight - 1.0) > 1e-9:
+        raise ValueError(
+            f"config.DIMENSION_WEIGHTS must sum to 1.0 across {list(config.DIMENSIONS)}, "
+            f"got {total_weight}."
+        )
+
+    dimensions = {}
+    weighted = 0.0
+    for name in config.DIMENSIONS:
+        entry = verdict["dimensions"][name]
+        weighted += entry["score"] * weights[name]
+        dimensions[name] = {
+            "label": config.DIMENSION_LABELS[name],
+            "score": entry["score"],
+            "weight": weights[name],
+            "rationale": entry.get("rationale", ""),
+            "evidence": entry.get("evidence", []),
+        }
+
+    base_score = weighted * config.DIMENSION_SCORE_MULTIPLIER
+
+    rules = []
+    total_deductions = 0
+    for rule in applicable_rules(template_type):
+        entry = verdict["rules"][rule["id"]]
+        violated = entry["violated"]
+        deduction = config.DEDUCTION_POINTS[rule["severity"]] if violated else 0
+        total_deductions += deduction
+        rules.append({
+            "id": rule["id"],
+            # Matches the rubric's Tier-3 column heading: each row describes the
+            # violation, and `passed` is True when it did NOT occur.
+            "violation": rule["description"],
+            "severity": rule["severity"],
+            "passed": not violated,
+            "deduction": deduction,
+            "evidence": entry.get("evidence", ""),
+        })
+
+    composite = max(0, base_score - total_deductions)
+
+    return {
+        "overall_score": int(round(composite)),
+        "base_score": round(base_score, 1),
+        "total_deductions": total_deductions,
+        "dimensions": dimensions,
+        "rules": rules,
+        "room_sequence": verdict.get("room_sequence", []),
+        "showcase_summary": verdict.get("showcase_summary", ""),
+        "summary": verdict.get("summary", ""),
+        "top_fixes": verdict.get("top_fixes", []),
+        "consistency_warnings": verdict.get("consistency_warnings", []),
+    }
 
 
 # ============================================================================
 # ORCHESTRATION
 # ============================================================================
+GATE_FAIL_REASON = (
+    "Failed on technical quality: noticeable motion issues detected "
+    "(lurches / stutters / glitches / unsmooth panning)"
+)
+
+
 def _gate_fail_reason(issues):
+    """
+    The rubric mandates this exact reason string, so it is emitted verbatim.
+    The rubric separately requires the timestamps be reported, which they are:
+    the specific issues and their MM:SS live in gate["issues"], and are appended
+    here only as a human-readable trailer.
+    """
     detail = ", ".join(f'{i["type"]} at {i["timestamp"]}' for i in issues)
-    return f"Failed on technical quality: noticeable motion issues detected ({detail})"
+    return f"{GATE_FAIL_REASON}. Detected: {detail}." if detail else GATE_FAIL_REASON
 
 
-def evaluate_video(source, template_type):
+def _empty_result(source, template_type, gate, reason, overall_score=None):
+    """The result envelope, with everything downstream of the gate left blank."""
+    return {
+        "source": source,
+        "template_type": template_type,
+        "gate": gate,
+        "overall_score": overall_score,
+        "reason": reason,
+        "room_sequence": [],
+        "dimensions": {},
+        "rules": [],
+        "base_score": 0,
+        "total_deductions": 0,
+        "showcase_summary": "",
+        "summary": "",
+        "top_fixes": [],
+        "consistency_warnings": [],
+        "judged": False,
+    }
+
+
+def evaluate_video(source, template_type, judge=True):
     """
     Run the full pipeline for one video: ingest -> CV gate -> (if the gate
     passes) Gemini judge -> composite score.
 
     template_type: one of "short", "medium", "long".
+    judge:         set False to stop after the CV gate (threshold calibration,
+                   or running without an API key).
 
-    The Gemini judge and scoring stages (Part 5/6) are not wired in yet --
-    a video that passes the gate currently returns with the gate's own
-    metrics/issues populated and everything downstream left empty, rather
-    than raising, so this can already be used to validate the gate on real
-    template videos end to end.
+    A video that fails the Tier-1 gate scores 0 and the judge is skipped
+    entirely, per the rubric -- that is a deliberate cost saving as well as a
+    scoring rule, since there is no point paying to judge footage that is
+    already disqualified.
     """
     if template_type not in ("short", "medium", "long"):
         raise ValueError(f"template_type must be one of 'short', 'medium', 'long', got {template_type!r}")
@@ -516,21 +1307,29 @@ def evaluate_video(source, template_type):
     try:
         gate = run_cv_gate(local_path)
 
-        result = {
-            "source": source,
-            "template_type": template_type,
-            "gate": gate,
-            "overall_score": 0 if not gate["passed"] else None,
-            "reason": (_gate_fail_reason(gate["issues"]) if not gate["passed"]
-                       else "Gate passed -- LLM judge not yet implemented (Part 5), stopping here"),
-            "room_sequence": [],
-            "dimensions": {},
-            "rules": [],
-            "base_score": 0,
-            "total_deductions": 0,
-            "summary": "",
-            "top_fixes": [],
-        }
+        if not gate["passed"]:
+            return _empty_result(
+                source, template_type, gate,
+                reason=_gate_fail_reason(gate["issues"]),
+                overall_score=0,
+            )
+
+        if not judge:
+            return _empty_result(
+                source, template_type, gate,
+                reason="Gate passed -- judge skipped (judge=False)",
+            )
+
+        verdict = run_judge(local_path, template_type)
+        scored = score(verdict, template_type)
+
+        result = _empty_result(source, template_type, gate, reason="")
+        result.update(scored)
+        result["judged"] = True
+        result["reason"] = (
+            f"Gate passed. Composite {scored['overall_score']}/100 "
+            f"(base {scored['base_score']} - {scored['total_deductions']} in deductions)."
+        )
         return result
     finally:
         if is_temp:
@@ -559,6 +1358,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", help="Path to write the result JSON (default: print to stdout)")
     parser.add_argument("--metrics-only", action="store_true",
                          help="Run only the CV gate and print raw metrics/issues for threshold calibration")
+    parser.add_argument("--no-judge", action="store_true",
+                         help="Stop after the CV gate; skip the Gemini judge and scoring (no API key needed)")
     args = parser.parse_args()
 
     try:
@@ -567,7 +1368,8 @@ if __name__ == "__main__":
         else:
             if not args.template:
                 parser.error("--template is required unless --metrics-only is set")
-            output = json.dumps(evaluate_video(args.source, args.template), indent=2)
+            result = evaluate_video(args.source, args.template, judge=not args.no_judge)
+            output = json.dumps(result, indent=2)
             if args.output:
                 Path(args.output).write_text(output)
                 print(f"Result written to {args.output}", file=sys.stderr)
