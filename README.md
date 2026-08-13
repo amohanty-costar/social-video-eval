@@ -1,4 +1,4 @@
-# Property Video Evaluator
+# Auto Video Evaluator
 
 Streamlit dashboard for the property marketing video evaluation pipeline.
 Paste a video URL or upload a file, pick a template, and get back a
