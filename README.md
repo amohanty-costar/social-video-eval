@@ -18,7 +18,6 @@ Every file states its purpose at the top. In short:
 | `rubric.md` | The evaluation standard. Read at runtime and injected into the prompt. |
 | `requirements.txt` | Python packages needed. |
 | `.gitignore` | Files git must never track — above all the API key. |
-| `test_*.py` | Checks. No API key, no network calls. |
 
 Edit `config.py`, `prompt.md` or `rubric.md` to retune the evaluation —
 `evaluate.py` shouldn't need touching.
@@ -50,14 +49,6 @@ silently.
 **The LLM scores; the code does arithmetic.** Gemini returns the four dimension
 scores and every rule verdict. `score()` computes the composite from them and
 never overrides a judgment.
-
-## Tests
-
-```bash
-python test_judge_scoring.py   # scoring math, rule table, schema, prompt, parsing
-python test_final_checks.py    # result shapes vs. the app, SDK round-trip
-python test_score_bands.py     # score bands and the spectrum bar
-```
 
 ## The score spectrum
 
