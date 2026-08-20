@@ -83,6 +83,44 @@ def render_score_spectrum(composite, base, deductions):
                 f'width:{max(0.0, min(100.0, base) - max(0.0, composite)):.4f}%"></div>')
         base_mark = f'<div class="sb-base" style="left:{_pct(base)}"></div>'
 
+    legend = (
+        '<div class="sb-legend">Needle = composite &nbsp;·&nbsp; thin line = base before '
+        'deductions &nbsp;·&nbsp; hatched = lost to compliance rules &nbsp;·&nbsp; '
+        'ticks = the only reachable scores</div>'
+        if lost else
+        '<div class="sb-legend">Needle = composite &nbsp;·&nbsp; '
+        'ticks = the only reachable scores</div>'
+    )
+
+    # The markup is assembled as a list and joined with NO newlines and NO
+    # indentation, deliberately.
+    #
+    # Streamlit runs this through a Markdown renderer before the HTML is used,
+    # and Markdown treats a four-space indent as a code block. When a piece is
+    # conditionally empty -- `lost` and `base_mark` are both "" whenever a video
+    # loses no points -- an indented multi-line template leaves behind a line of
+    # bare whitespace. That ends the HTML block, and everything after it renders
+    # as literal text: the needle disappears and a raw <div ...> shows on screen.
+    #
+    # Keeping it one flat string with empty pieces filtered out makes that
+    # impossible. Do not "tidy" this into an indented f-string.
+    body = "".join(piece for piece in [
+        '<div class="sb-box">',
+        f'<span class="sb-chip">{html.escape(label)}</span>',
+        '<div class="sb-track">',
+        "".join(zones),
+        f'<div class="sb-ticks">{ticks}</div>',
+        lost,
+        base_mark,
+        f'<div class="sb-cap" style="left:{_pct(composite)}"></div>',
+        f'<div class="sb-needle" style="left:{_pct(composite)}"></div>',
+        '</div>',
+        f'<div class="sb-bands">{"".join(captions)}</div>',
+        f'<div class="sb-scale">{scale}</div>',
+        legend,
+        '</div>',
+    ] if piece)
+
     st.markdown(
         f"""
 <style>
@@ -112,24 +150,7 @@ def render_score_spectrum(composite, base, deductions):
 .sb-scale span {{ position:absolute; transform:translateX(-50%); }}
 .sb-legend {{ font-size:11.5px; opacity:.7; margin-top:9px; }}
 </style>
-<div class="sb-box">
-  <span class="sb-chip">{html.escape(label)}</span>
-  <div class="sb-track">
-    {''.join(zones)}
-    <div class="sb-ticks">{ticks}</div>
-    {lost}
-    {base_mark}
-    <div class="sb-cap" style="left:{_pct(composite)}"></div>
-    <div class="sb-needle" style="left:{_pct(composite)}"></div>
-  </div>
-  <div class="sb-bands">{''.join(captions)}</div>
-  <div class="sb-scale">{scale}</div>
-  {'<div class="sb-legend">Needle = composite &nbsp;·&nbsp; thin line = base before deductions'
-   ' &nbsp;·&nbsp; hatched = lost to compliance rules &nbsp;·&nbsp;'
-   ' ticks = the only reachable scores</div>' if lost else
-   '<div class="sb-legend">Needle = composite &nbsp;·&nbsp;'
-   ' ticks = the only reachable scores</div>'}
-</div>
+{body}
 """,
         unsafe_allow_html=True,
     )
