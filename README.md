@@ -86,7 +86,7 @@ App will be at `http://<server-ip>:8501`.
 ## API key
 
 The Gemini judge needs an API key. File a ticket for an API key, you will have to provide IP restrictions since it is a back-end key. 
-Refer to previous keys. 
+Refer to previous tickets. 
 It is resolved in this order:
 
 1. `GEMINI_API_KEY` environment variable
