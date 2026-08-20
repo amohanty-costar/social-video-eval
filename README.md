@@ -85,7 +85,8 @@ App will be at `http://<server-ip>:8501`.
 
 ## API key
 
-The Gemini judge needs an API key ([get one here](https://aistudio.google.com/apikey)).
+The Gemini judge needs an API key. File a ticket for an API key, you will have to provide IP restrictions since it is a back-end key. 
+Refer to previous keys. 
 It is resolved in this order:
 
 1. `GEMINI_API_KEY` environment variable
@@ -131,22 +132,3 @@ python evaluate.py --source /path/to/video.mp4 --metrics-only
 - App listens on port `8501` by default (Streamlit's default).
 - No database or external service dependencies beyond pip packages.
 
-## Known limitations
-
-- **1 FPS sampling.** Gemini samples video for visual understanding at one frame
-  per second. Room sequencing and the compliance rules tolerate that well. The
-  "Hook / Opening" dimension covers the first ~3 seconds, so it is judging
-  roughly three frames — treat that sub-score as the least reliable number in
-  the report.
-- **Hook and Framing are LLM-only.** `rubric.md` marks those two dimensions
-  "LLM + CV", but no CV signal is currently passed to the judge — the CV gate's
-  per-frame data is used for the Tier-1 pass/fail and nothing else. Feeding the
-  opening seconds' sharpness/brightness into the prompt would close this.
-- **The judge is trusted on the "first 3 stops" rules.** Those two are the only
-  rules mechanically derivable from the room sequence the judge also returns, so
-  `cross_check_stop_rules()` compares them and surfaces a warning in the report
-  when the judge contradicts itself. It does not override the verdict, because
-  room naming is too fuzzy for a string match to be authoritative.
-- **Thresholds are uncalibrated.** Every value marked `CALIBRATION-PENDING` in
-  `config.py` is still a starting guess. Run `--metrics-only` against known-good
-  and known-bad videos before trusting the gate.
